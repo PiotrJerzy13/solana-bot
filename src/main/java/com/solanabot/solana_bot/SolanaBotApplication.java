@@ -16,8 +16,11 @@ public class SolanaBotApplication {
 	public static void main(String[] args) throws Exception {
 
 		String apiKey = System.getenv("JUPITER_API_KEY");
-		JupiterClient client = new JupiterClient(apiKey);
-		TokenPoller poller = new TokenPoller(client);
+		String wsUrl  = System.getenv("SOLANA_WS_URL");
+
+		JupiterClient client      = new JupiterClient(apiKey);
+		PaperWallet   paperWallet = new PaperWallet();
+		TokenPoller   poller      = new TokenPoller(client, paperWallet);
 
 		if (apiKey != null && !apiKey.isBlank()) {
 			System.out.println("✓ Using authenticated Jupiter API");
@@ -31,14 +34,12 @@ public class SolanaBotApplication {
 		switch (mode) {
 
 			case "trending" -> {
-				// print trending tokens for all intervals and exit
 				poller.printTrending("5m");
 				poller.printTrending("1h");
 				poller.printTrending("24h");
 			}
 
 			case "search" -> {
-				// search for a specific token by name or symbol
 				String query = args.length > 1 ? args[1] : "SOL";
 				System.out.println("\nSearching for: " + query);
 				client.searchTokens(query)
@@ -47,13 +48,16 @@ public class SolanaBotApplication {
 						.forEach(System.out::println);
 			}
 
+			case "status" -> poller.printWalletStatus();
+
 			default -> {
-				// default mode — start the polling loop
-				// first print a snapshot of trending tokens
+				if (wsUrl != null && !wsUrl.isBlank()) {
+					System.out.println("⚡ WebSocket detection enabled: " + wsUrl);
+					new SolanaWebSocketClient(wsUrl, poller::handlePoolEvent).connect();
+				}
+
 				poller.printTrending("1h");
 				System.out.println();
-
-				// then start watching for new listings
 				poller.start();
 			}
 		}

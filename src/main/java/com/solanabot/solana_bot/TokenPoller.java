@@ -1,37 +1,50 @@
 package com.solanabot.solana_bot;
 
-import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Polls Jupiter for newly listed tokens and applies safety filters.
- * This is the core of Phase 2 — detecting opportunities before acting on them.
+ * Polls Jupiter for newly listed tokens and handles WebSocket pool events.
+ *
+ * evaluateToken() is the single evaluation path for both detection sources:
+ *   • REST poll  — checkForNewTokens() called every 60 s
+ *   • WebSocket  — handlePoolEvent() called by SolanaWebSocketClient callback
+ *
+ * seenTokenIds uses ConcurrentHashMap.newKeySet() so both threads can safely
+ * add/query without external synchronization.
  */
 public class TokenPoller {
 
-    // ── Safety filter thresholds — tune these to your risk tolerance ──
-    private static final double MIN_MCAP       = 10_000;   // minimum $10k market cap
-    private static final double MIN_LIQUIDITY  = 5_000;    // minimum $5k liquidity
-    private static final int    MIN_HOLDERS    = 50;        // minimum 50 holders
-    private static final double MIN_CIRC_RATIO = 0.1;      // at least 10% in circulation
-    private static final int    POLL_INTERVAL  = 60_000;   // poll every 60 seconds
+    // ── Safety filter thresholds — tune to your risk tolerance ───────────────
+    private static final double MIN_MCAP       = 10_000;
+    private static final double MIN_LIQUIDITY  = 5_000;
+    private static final int    MIN_HOLDERS    = 50;
+    private static final double MIN_CIRC_RATIO = 0.1;
+    private static final int    POLL_INTERVAL  = 60_000;   // ms
 
     private final JupiterClient jupiterClient;
-    private final Set<String> seenTokenIds = new HashSet<>();
+    private final PaperWallet   paperWallet;
+    private final TokenScorer   scorer         = new TokenScorer();
+    private final TokenResolver tokenResolver;
 
-    public TokenPoller(JupiterClient jupiterClient) {
-        this.jupiterClient = jupiterClient;
+    // ConcurrentHashMap-backed set: add() is atomic, safe from REST + WS threads
+    private final Set<String> seenTokenIds = ConcurrentHashMap.newKeySet();
+
+    public TokenPoller(JupiterClient jupiterClient, PaperWallet paperWallet) {
+        this.jupiterClient  = jupiterClient;
+        this.paperWallet    = paperWallet;
+        this.tokenResolver  = new TokenResolver(jupiterClient);
     }
 
-    // ── Main polling loop ─────────────────────────────────────
+    // ── REST polling loop ─────────────────────────────────────────────────────
 
     public void start() throws InterruptedException {
         System.out.println("═══════════════════════════════════════");
         System.out.println("  Solana Token Poller — Starting up");
         System.out.println("═══════════════════════════════════════");
 
-        // first run — silently populate known tokens
         List<JupiterToken> initial = jupiterClient.getRecentTokens();
         initial.forEach(t -> seenTokenIds.add(t.getId()));
         System.out.println("✓ Loaded " + seenTokenIds.size() + " existing recent tokens");
@@ -43,8 +56,6 @@ public class TokenPoller {
         }
     }
 
-    // ── One poll cycle ────────────────────────────────────────
-
     private void checkForNewTokens() {
         List<JupiterToken> current = jupiterClient.getRecentTokens();
 
@@ -54,27 +65,62 @@ public class TokenPoller {
         }
 
         List<JupiterToken> newTokens = current.stream()
-                .filter(t -> t.getId() != null && !seenTokenIds.contains(t.getId()))
+                .filter(t -> t.getId() != null && seenTokenIds.add(t.getId()))
                 .toList();
 
         if (newTokens.isEmpty()) {
             System.out.println("○ No new tokens since last check");
+        } else {
+            System.out.println("──────────────────────────────────────");
+            System.out.println("🆕 " + newTokens.size() + " new token(s) detected!");
+            System.out.println("──────────────────────────────────────");
+
+            for (JupiterToken token : newTokens) {
+                printTokenDetails(token);
+                evaluateToken(token);
+                System.out.println();
+            }
+        }
+
+        // Run exit checks every cycle so TP/SL/timeout fire even when no new tokens appear
+        paperWallet.checkExits(current);
+    }
+
+    // ── WebSocket detection path ──────────────────────────────────────────────
+
+    /**
+     * Called by SolanaWebSocketClient on the resolver thread pool when a new
+     * Raydium or Pump.fun pool creation is detected.
+     * Dedupes, resolves baseMint → JupiterToken, then calls evaluateToken().
+     */
+    public void handlePoolEvent(PoolEvent event) {
+        System.out.println("⚡ WS event: " + event.source() + " | " + event.signature().substring(0, 12));
+        String baseMint = event.baseMint();
+
+
+        // Atomic add: returns false if the mint was already in the set
+        if (!seenTokenIds.add(baseMint)) return;
+
+        System.out.printf("%n⚡ Pool event [%s] %s... sig: %s...%n",
+                event.source(),
+                baseMint.substring(0, 8),
+                event.signature().substring(0, 12));
+
+        Optional<JupiterToken> tokenOpt = tokenResolver.resolve(event);
+        if (tokenOpt.isEmpty()) {
+            System.out.printf("  ⚠️  Could not resolve %s... — skipping%n", baseMint.substring(0, 8));
             return;
         }
 
-        System.out.println("──────────────────────────────────────");
-        System.out.println("🆕 " + newTokens.size() + " new token(s) detected!");
-        System.out.println("──────────────────────────────────────");
+        JupiterToken token = tokenOpt.get();
+        seenTokenIds.add(token.getId()); // id == baseMint, but add defensively
 
-        for (JupiterToken token : newTokens) {
-            seenTokenIds.add(token.getId());
-            printTokenDetails(token);
-            evaluateToken(token);
-            System.out.println();
-        }
+        printTokenDetails(token);
+        evaluateToken(token);
+        System.out.println();
     }
 
-    // ── Token display ─────────────────────────────────────────
+    // ── Token display ─────────────────────────────────────────────────────────
 
     private void printTokenDetails(JupiterToken token) {
         System.out.println("Name:       " + token.getName() + " (" + token.getSymbol() + ")");
@@ -87,56 +133,40 @@ public class TokenPoller {
         System.out.println("Verified:   " + (token.hasVerifiedTag() ? "✓ Yes" : "✗ No"));
 
         if (token.getAudit() != null) {
-            System.out.println("Mint Auth:  " + (token.isMintSafe() ? "✓ Disabled (safe)" : "⚠️  Active (risk)"));
-            System.out.println("Freeze Auth:" + (token.getAudit().isFreezeAuthorityDisabled() ? "✓ Disabled (safe)" : "⚠️  Active (risk)"));
-            System.out.printf ("Top Holders:%.2f%% of supply%n", token.getAudit().getTopHoldersPercentage());
+            System.out.println("Mint Auth:  " + (token.isMintSafe()
+                    ? "✓ Disabled (safe)" : "⚠️  Active (risk)"));
+            System.out.println("Freeze Auth:" + (token.getAudit().isFreezeAuthorityDisabled()
+                    ? "✓ Disabled (safe)" : "⚠️  Active (risk)"));
+            System.out.printf ("Top Holders:%.2f%% of supply%n",
+                    token.getAudit().getTopHoldersPercentage());
         }
 
-        if (token.getWebsite() != null)  System.out.println("Website:    " + token.getWebsite());
-        if (token.getTwitter() != null)  System.out.println("Twitter:    " + token.getTwitter());
+        if (token.getWebsite()   != null) System.out.println("Website:    " + token.getWebsite());
+        if (token.getTwitter()   != null) System.out.println("Twitter:    " + token.getTwitter());
         if (token.getFirstPool() != null) System.out.println("Pool Created: " + token.getFirstPool().getCreatedAt());
     }
 
-    // ── Safety evaluation ─────────────────────────────────────
+    // ── Safety evaluation + scoring ───────────────────────────────────────────
 
     private void evaluateToken(JupiterToken token) {
-        System.out.println("\n--- Safety Check ---");
+        if (!token.isSafeToTrade()) {
+            System.out.println("  ❌ Failed mandatory safety checks — skipping score");
+            return;
+        }
 
-        boolean passedMcap      = check("MCap > $" + String.format("%,.0f", MIN_MCAP),
-                token.getMcap() >= MIN_MCAP);
-        boolean passedLiquidity = check("Liquidity > $" + String.format("%,.0f", MIN_LIQUIDITY),
-                token.getLiquidity() >= MIN_LIQUIDITY);
-        boolean passedHolders   = check("Holders > " + MIN_HOLDERS,
-                token.getHolderCount() >= MIN_HOLDERS);
-        boolean passedMint      = check("Mint authority disabled",
-                token.isMintSafe());
-        boolean passedCirc      = check("Circ supply > " + (int)(MIN_CIRC_RATIO * 100) + "% of total",
-                token.getCircToTotalRatio() >= MIN_CIRC_RATIO);
+        TokenScorer.ScoreResult result = scorer.score(token);
+        result.print(token.getSymbol());
 
-        boolean allPassed = passedMcap && passedLiquidity && passedHolders
-                && passedMint && passedCirc;
-
-        System.out.println();
-        if (allPassed) {
-            System.out.println("✅ PASSED all safety checks — worth investigating");
-            // → this is where you'd trigger a Jupiter swap in Phase 4
-        } else {
-            System.out.println("❌ FAILED safety checks — skipping");
+        if (result.isBuyCandidate()) {
+            System.out.println("  → Paper buy");
+            paperWallet.buy(token, result);
+        } else if (result.total() >= TokenScorer.THRESHOLD_WATCH) {
+            System.out.println("  → Added to watchlist");
         }
     }
 
-    private boolean check(String label, boolean passed) {
-        System.out.println("  " + (passed ? "✓" : "✗") + " " + label);
-        return passed;
-    }
+    // ── Trending tokens ───────────────────────────────────────────────────────
 
-    // ── Trending tokens ───────────────────────────────────────
-
-    /**
-     * Prints the top trending tokens for a given time interval.
-     * Useful for manual monitoring.
-     * @param interval one of: 5m, 1h, 6h, 24h
-     */
     public void printTrending(String interval) {
         System.out.println("\n═══ Trending tokens (" + interval + ") ═══");
         List<JupiterToken> trending = jupiterClient.getTrendingTokens(interval);
@@ -153,5 +183,12 @@ public class TokenPoller {
                     i + 1, t.getSymbol(), t.getUsdPrice(), t.getMcap(), t.getLiquidity()
             );
         }
+    }
+
+    // ── Wallet status (used by "status" run mode) ─────────────────────────────
+
+    public void printWalletStatus() {
+        paperWallet.printOpenPositions();
+        paperWallet.printSummary();
     }
 }
