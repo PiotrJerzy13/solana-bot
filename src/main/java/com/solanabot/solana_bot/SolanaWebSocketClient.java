@@ -33,7 +33,6 @@ public class SolanaWebSocketClient {
 
     private static final String RAYDIUM_PROGRAM  = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
     private static final String PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
-    private static final String PUMP_MINT_AUTH   = "TSLa5Ay9bFnMFzH7e8KNkpgVb7bVDmEZGvOZGLrDpgK";
 
     private static final long BACKOFF_MIN_MS = 1_000;
     private static final long BACKOFF_MAX_MS = 30_000;
@@ -44,18 +43,19 @@ public class SolanaWebSocketClient {
     private final LogParser logParser = new LogParser();
     private final HttpClient httpClient;
 
-    // One cached thread per pending resolution so the WS listener thread is never blocked
-    private final ExecutorService resolverPool = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "pool-resolver");
-        t.setDaemon(true);
-        return t;
-    });
-
-    private volatile long mintAuthSubId = -1;
+    // Scheduled pool — schedule() returns immediately, thread only consumed when task fires
+    private final java.util.concurrent.ScheduledExecutorService resolverPool =
+            Executors.newScheduledThreadPool(20, r -> {
+                Thread t = new Thread(r, "pool-resolver");
+                t.setDaemon(true);
+                return t;
+            });
 
     public SolanaWebSocketClient(String wsUrl, Consumer<PoolEvent> callback) {
         this.wsUrl    = wsUrl;
-        this.httpUrl  = wsUrl.replace("wss://", "https://").replace("ws://", "http://");
+        String envHttp = System.getenv("SOLANA_HTTP_URL");
+        this.httpUrl  = (envHttp != null && !envHttp.isBlank()) ? envHttp
+                      : wsUrl.replace("wss://", "https://").replace("ws://", "http://");
         this.callback = callback;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
@@ -89,8 +89,7 @@ public class SolanaWebSocketClient {
 
                 sendSubscribe(ws, RAYDIUM_PROGRAM);
                 sendSubscribe(ws, PUMP_FUN_PROGRAM);
-                sendMintAuthSubscribe(ws);
-                System.out.println("⚡ Subscribed to Raydium AMM + Pump.fun logs + Pump.fun mint authority");
+                System.out.println("⚡ Subscribed to Raydium AMM + Pump.fun logs");
 
                 backoffMs = BACKOFF_MIN_MS;
                 listener.awaitClose();
@@ -118,51 +117,35 @@ public class SolanaWebSocketClient {
         ws.sendText(req, true);
     }
 
-    // id=99 so the confirmation can be matched and mintAuthSubId captured
-    private void sendMintAuthSubscribe(WebSocket ws) {
-        String req = "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"logsSubscribe\"," +
-                "\"params\":[{\"mentions\":[\"" + PUMP_MINT_AUTH + "\"]}," +
-                "{\"commitment\":\"processed\"}]}";
-        ws.sendText(req, true);
-    }
-
     // ── Message handling ──────────────────────────────────────────────────────
 
     private void handleMessage(String json) {
-        try {
-            JsonObject msg    = JsonParser.parseString(json).getAsJsonObject();
-            JsonElement idEl  = msg.get("id");
-            JsonElement resEl = msg.get("result");
-            // Capture subscription ID assigned by the server for the mint-auth subscription (id=99)
-            if (idEl != null && idEl.getAsInt() == 99 && resEl != null && resEl.isJsonPrimitive()) {
-                mintAuthSubId = resEl.getAsLong();
-            }
-            JsonElement methodEl = msg.get("method");
-            if ("logsNotification".equals(methodEl != null ? methodEl.getAsString() : null) && mintAuthSubId != -1) {
-                long subId = msg.getAsJsonObject("params").get("subscription").getAsLong();
-                if (subId == mintAuthSubId) {
-                    String sig = msg.getAsJsonObject("params").getAsJsonObject("result")
-                            .getAsJsonObject("value").get("signature").getAsString();
-                    System.out.println("[WS-MINT] sig=" + sig.substring(0, 12));
-                }
-            }
-        } catch (Exception ignored) {}
-
         Optional<LogParser.Notification> parsed = logParser.parse(json);
         if (parsed.isPresent()) {
             System.out.println("[WS-2] LogParser HIT: " + parsed.get().source()
                     + " sig=" + parsed.get().signature().substring(0, 12));
         }
-        parsed.ifPresent(notification ->
-                resolverPool.submit(() -> {
-                    Optional<PoolEvent> event = resolveAccounts(
-                            notification.signature(), notification.source());
-                    System.out.println("[WS-4] resolveAccounts result: " + (event.isPresent()
-                            ? "✓ baseMint=" + event.get().baseMint().substring(0, 8)
-                            : "✗ empty — callback NOT fired"));
-                    event.ifPresent(callback);
-                })
-        );
+        parsed.ifPresent(notification -> {
+            try {
+                resolverPool.schedule(() -> {
+                    System.out.println("[WS-2b] resolver thread executing for sig=" + notification.signature().substring(0, 12));
+                    try {
+                        Optional<PoolEvent> event = resolveAccounts(
+                                notification.signature(), notification.source());
+                        String bm = event.isPresent() ? event.get().baseMint() : "";
+                        System.out.println("[WS-4] resolveAccounts result: " + (event.isPresent()
+                                ? "✓ baseMint=" + bm.substring(0, Math.min(8, bm.length()))
+                                : "✗ empty — callback NOT fired"));
+                        event.ifPresent(callback);
+                    } catch (Throwable t) {
+                        System.out.println("[WS-ERR] " + t.getClass().getSimpleName() + ": " + t.getMessage());
+                    }
+                }, 32, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (java.util.concurrent.RejectedExecutionException e) {
+                System.out.println("[WS-REJECTED] pool full, dropping event for sig="
+                        + notification.signature().substring(0, 12));
+            }
+        });
     }
 
     // ── getTransaction → extract baseMint / quoteMint / poolAddress ───────────
@@ -171,17 +154,24 @@ public class SolanaWebSocketClient {
         try {
             String body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTransaction\"," +
                     "\"params\":[\"" + signature + "\"," +
-                    "{\"encoding\":\"json\",\"maxSupportedTransactionVersion\":0}]}";
+                    "{\"encoding\":\"json\",\"maxSupportedTransactionVersion\":0,\"commitment\":\"finalized\"}]}";
 
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(httpUrl))
                     .header("Content-Type", "application/json")
-                    .timeout(Duration.ofSeconds(10))
                     .POST(HttpRequest.BodyPublishers.ofString(body))
                     .build();
 
-            HttpResponse<String> response = httpClient.send(
-                    request, HttpResponse.BodyHandlers.ofString());
+            System.out.println("[WS-HTTP-URL] " + httpUrl);
+            HttpResponse<String> response;
+            try {
+                response = httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                        .get(15, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (java.util.concurrent.TimeoutException te) {
+                System.out.println("[WS-TIMEOUT] getTransaction timed out after 15s for sig="
+                        + signature.substring(0, 12));
+                return Optional.empty();
+            }
 
             System.out.println("[WS-3] getTransaction HTTP " + response.statusCode()
                     + " body[0:200]=" + response.body().substring(0, Math.min(200, response.body().length())));
@@ -203,7 +193,6 @@ public class SolanaWebSocketClient {
             String targetProgram = (source == PoolEvent.ProgramSource.RAYDIUM)
                     ? RAYDIUM_PROGRAM : PUMP_FUN_PROGRAM;
 
-            // Find the programIdIndex for the target program in the accountKeys list
             int programIdx = -1;
             for (int i = 0; i < accountKeys.size(); i++) {
                 if (targetProgram.equals(accountKeys.get(i).getAsString())) {
@@ -212,11 +201,10 @@ public class SolanaWebSocketClient {
                 }
             }
             if (programIdx < 0) {
-                System.out.println("[WS-3] program not found in accountKeys (accountKeys count=" + accountKeys.size() + ")");
+                System.out.println("[WS-3] program not found in accountKeys (count=" + accountKeys.size() + ")");
                 return Optional.empty();
             }
 
-            // Find the instruction that invokes the target program
             JsonObject targetInstr = null;
             for (JsonElement el : instructions) {
                 JsonObject instr = el.getAsJsonObject();
@@ -226,27 +214,22 @@ public class SolanaWebSocketClient {
                 }
             }
             if (targetInstr == null) {
-                System.out.println("[WS-3] no instruction with programIdIndex=" + programIdx + " found");
+                System.out.println("[WS-3] no instruction with programIdIndex=" + programIdx);
                 return Optional.empty();
             }
 
             JsonArray accounts = targetInstr.getAsJsonArray("accounts");
 
-            // Added log line here before index lookups
-            System.out.println("ACCOUNTS " + source + ": " + accounts);
-
             String baseMint, quoteMint, poolAddress;
 
             if (source == PoolEvent.ProgramSource.RAYDIUM) {
-                // ⚠ Approximate Raydium V4 initialize2 instruction account indices
-                //   [3]=amm pool, [7]=coinMint (base), [8]=pcMint (quote) — verify vs mainnet
+                // ⚠ Approximate Raydium V4 initialize2 indices — verify vs mainnet
                 if (accounts.size() < 9) return Optional.empty();
                 poolAddress = accountKeys.get(accounts.get(3).getAsInt()).getAsString();
                 baseMint    = accountKeys.get(accounts.get(7).getAsInt()).getAsString();
                 quoteMint   = accountKeys.get(accounts.get(8).getAsInt()).getAsString();
             } else {
-                // ⚠ Approximate Pump.fun Create instruction account indices
-                //   [0]=mint (new token), [2]=bondingCurve, quote is always native SOL — verify vs mainnet
+                // Pump.fun CreateV2: [0]=mint, [2]=bondingCurve, quote=SOL
                 if (accounts.size() < 3) return Optional.empty();
                 baseMint    = accountKeys.get(accounts.get(0).getAsInt()).getAsString();
                 quoteMint   = PoolEvent.SOL_MINT;
@@ -257,8 +240,8 @@ public class SolanaWebSocketClient {
                     signature, poolAddress, baseMint, quoteMint, source, Instant.now()));
 
         } catch (Exception e) {
-            System.err.println("⚡ Failed to resolve accounts for "
-                    + signature.substring(0, 12) + "...: " + e.getMessage());
+            System.out.println("[WS-ERR-INNER] " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            System.err.println("[WS-ERR-INNER] " + e.getClass().getSimpleName() + ": " + e.getMessage());
             return Optional.empty();
         }
     }
@@ -281,8 +264,6 @@ public class SolanaWebSocketClient {
             if (last) {
                 String message = buffer.toString();
                 buffer.setLength(0);
-                System.out.println("[WS-1] complete msg (" + message.length() + " chars): "
-                        + message.substring(0, Math.min(120, message.length())));
                 handleMessage(message);
             }
             webSocket.request(1);

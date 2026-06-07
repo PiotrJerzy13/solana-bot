@@ -18,7 +18,7 @@ public class LogParser {
 
     // Triggers that identify a new pool creation within the logs array
     private static final String RAYDIUM_TRIGGER  = "initialize2";
-    private static final String PUMP_FUN_TRIGGER = "Program log: Instruction: Create";
+    private static final String PUMP_FUN_TRIGGER = "Program log: Instruction: CreateV2";
 
     /**
      * Returns a Notification if the message is a successful pool-creation event
@@ -43,7 +43,6 @@ public class LogParser {
 
             // Skip failed transactions
             if (!value.get("err").isJsonNull()) {
-                System.out.println("[LP] skip: failed tx sig=" + value.get("signature").getAsString().substring(0, 12));
                 return Optional.empty();
             }
 
@@ -67,9 +66,6 @@ public class LogParser {
                     return Optional.of(new Notification(signature, source));
                 }
             }
-            if (source == PoolEvent.ProgramSource.PUMP_FUN && logs.toString().contains("Instruction: Create")) System.out.println("[LP] PUMP_FUN instruction logs: " + java.util.stream.StreamSupport.stream(logs.spliterator(), false).map(JsonElement::getAsString).filter(l -> l.contains("Instruction:")).collect(java.util.stream.Collectors.toList()));
-            System.out.println("[LP] no trigger: source=" + source + " logs=" + logs.size()
-                    + " last=\"" + (logs.size() > 0 ? logs.get(logs.size()-1).getAsString() : "") + "\"");
             return Optional.empty();
 
         } catch (Exception e) {
