@@ -19,8 +19,8 @@ SOLANA_HTTP_URL=https://your-rpc  # HTTP RPC for getTransaction — use api.main
                                   # optional: derived from SOLANA_WS_URL if not set
 
 # Full run with all env vars
-SOLANA_WS_URL=wss://mainnet.helius-rpc.com/?api-key=YOUR_KEY \
-SOLANA_HTTP_URL=https://api.mainnet-beta.solana.com \
+SOLANA_WS_URL=wss://mainnet.helius-rpc.com/?api-key=d772d59b-ab06-447d-bf0a-b3fcc1e86934 \  
+SOLANA_HTTP_URL=https://mainnet.helius-rpc.com/?api-key=d772d59b-ab06-447d-bf0a-b3fcc1e86934 \
 mvn spring-boot:run
 
 # Tests
